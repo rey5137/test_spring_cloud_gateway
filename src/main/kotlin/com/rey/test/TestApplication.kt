@@ -1,56 +1,44 @@
 package com.rey.test
 
-import io.netty.bootstrap.ServerBootstrap
 import io.netty.buffer.Unpooled
-import io.netty.channel.*
-import io.netty.channel.nio.NioEventLoopGroup
-import io.netty.channel.socket.nio.NioServerSocketChannel
-import io.netty.handler.codec.http.*
+import io.netty.channel.ChannelOption
+import io.netty.handler.codec.http.HttpHeaderNames
 import io.netty.util.CharsetUtil
+import io.netty.util.NettyRuntime
+import io.netty.util.internal.SystemPropertyUtil
+import reactor.core.publisher.Mono
+import reactor.netty.http.server.HttpServer
+import reactor.netty.resources.LoopResources
 
 
-class TestApplication {
-
-    @Throws(Exception::class)
-    fun run() {
-        val bossGroup: EventLoopGroup = NioEventLoopGroup()
-        val workerGroup: EventLoopGroup = NioEventLoopGroup()
-        try {
-            val httpBootstrap = ServerBootstrap()
-            httpBootstrap.group(bossGroup, workerGroup)
-                .channel(NioServerSocketChannel::class.java)
-                .childHandler(ServerInitializer())
-                .option(ChannelOption.SO_BACKLOG, 128)
-                .childOption(ChannelOption.SO_KEEPALIVE, true)
-            val httpChannel: ChannelFuture = httpBootstrap.bind(8081).sync()
-            httpChannel.channel().closeFuture().sync()
-        } finally {
-            workerGroup.shutdownGracefully()
-            bossGroup.shutdownGracefully()
-        }
-    }
-}
-
-class ServerInitializer : ChannelInitializer<Channel>() {
-    override fun initChannel(ch: Channel) {
-        val pipeline: ChannelPipeline = ch.pipeline()
-        pipeline.addLast(HttpServerCodec())
-        pipeline.addLast(HttpObjectAggregator(Int.MAX_VALUE))
-        pipeline.addLast(ServerHandler())
-    }
-}
-
-class ServerHandler : SimpleChannelInboundHandler<FullHttpRequest?>() {
-    override fun channelRead0(ctx: ChannelHandlerContext, msg: FullHttpRequest?) {
-        val content = Unpooled.copiedBuffer("Hello World!", CharsetUtil.UTF_8)
-        val response: FullHttpResponse = DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK, content)
-        response.headers()[HttpHeaderNames.CONTENT_TYPE] = "text/html"
-        response.headers()[HttpHeaderNames.CONTENT_LENGTH] = content.readableBytes()
-        ctx.write(response)
-        ctx.flush()
-    }
-}
+class TestApplication
 
 fun main(args: Array<String>) {
-    TestApplication().run()
+    val nThreads = Math.max(1, SystemPropertyUtil.getInt(
+        "io.netty.eventLoopThreads", NettyRuntime.availableProcessors() * 2))
+    val loop = LoopResources.create("test", nThreads, nThreads, true)
+    try {
+        val disposableServer = HttpServer.create()
+            .port(8081)
+            .tcpConfiguration {
+                it.selectorOption(ChannelOption.SO_BACKLOG, 128)
+                    .option(ChannelOption.SO_KEEPALIVE, true)
+                    // Specifies: bossGroup, workerGroup, NIO transport
+                    .runOn(loop, false)
+            }
+            .handle { req, res ->
+                req.receive()
+                    // Aggregates the incoming data
+                    .aggregate()
+                    .then(res.header(HttpHeaderNames.CONTENT_TYPE, "text/html")
+                        .header(HttpHeaderNames.CONTENT_LENGTH, "12")
+                        // Sending Mono will send FullHttpResponse
+                        .send(Mono.just(Unpooled.copiedBuffer("Hello World!", CharsetUtil.UTF_8)))
+                        .then())
+            }
+            .bindNow()
+        disposableServer.onDispose().block()
+    } finally {
+        loop.disposeLater().block()
+    }
 }
